@@ -17,4 +17,6 @@ Ese archivo debe seguir este formato por cada linea
 
 5.- Ejecuta el script
 
+python3 generate_queries.py
+
 6.- Por cada carpeta de empresa emisora se creara un archivo queries.sql como resultado
