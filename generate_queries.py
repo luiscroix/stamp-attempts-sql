@@ -1,257 +1,149 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Script para generar archivos SQL con comandos de consola de Symfony
-basados en archivos CSV e XML de timbrados duplicados.
+Genera archivos querys.sql en cada carpeta de compañía.
 
-El formato de salida es:
-bin/console doctrine:query:sql "UPDATE invoice_invoice_attempts SET ..."
+Recorre las carpetas de compañías que tengan una subcarpeta "XMLS",
+lee los archivos .xml de cada XMLS y genera un archivo querys.sql
+en la carpeta de la compañía con los UPDATE para invoice_invoice_attempts,
+listos para ejecutar con:
 
-Las comillas están correctamente escapadas para ejecutarse en la consola.
+  bin/console doctrine:query:sql "SQL"
 """
 
-import os
-import csv
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
-import re
 
 
-def escape_sql_string(value):
-    """Escapa comillas simples en strings SQL."""
-    if value is None:
-        return "null"
-    return "'" + str(value).replace("'", "''") + "'"
+# Namespaces CFDI 4.0 y TimbreFiscalDigital
+NS = {
+    "cfdi": "http://www.sat.gob.mx/cfd/4",
+    "tfd": "http://www.sat.gob.mx/TimbreFiscalDigital",
+}
 
 
-def escape_for_shell_double_quotes(value):
-    r"""Escapa un string para que funcione dentro de comillas dobles en la shell.
-    
-    Dentro de comillas dobles en shell, necesitamos escapar:
-    - Comillas dobles con \"
-    - Backslashes con \\
-    - Variables $ con \$
-    - Backticks con \`
+def extraer_tfd_como_texto(contenido_xml: str) -> str:
+    """Extrae el elemento TimbreFiscalDigital completo como cadena."""
+    # Buscar <tfd:TimbreFiscalDigital ... /> o </tfd:TimbreFiscalDigital>
+    match = re.search(
+        r"<tfd:TimbreFiscalDigital[^>]*(?:/>|>.*?</tfd:TimbreFiscalDigital>)",
+        contenido_xml,
+        re.DOTALL,
+    )
+    if match:
+        return match.group(0)
+    # Por si el prefijo es otro o no hay prefijo
+    match = re.search(
+        r"<[^:]*:?TimbreFiscalDigital[^>]*(?:/>|>.*?</[^:]*:?TimbreFiscalDigital>)",
+        contenido_xml,
+        re.DOTALL,
+    )
+    if match:
+        return match.group(0)
+    return ""
+
+
+def extraer_folio_y_uuid(contenido_xml: str) -> tuple[str | None, str | None]:
+    """Extrae Folio del Comprobante y UUID del TimbreFiscalDigital."""
+    try:
+        root = ET.fromstring(contenido_xml)
+        folio = None
+        uuid = None
+        # Folio en Comprobante (puede tener prefijo cfdi:)
+        for elem in [root] + list(root.iter()):
+            tag = elem.tag
+            if "Comprobante" in tag or tag == "{" + NS["cfdi"] + "}Comprobante":
+                folio = elem.get("Folio")
+            if "TimbreFiscalDigital" in tag or tag == "{" + NS["tfd"] + "}TimbreFiscalDigital":
+                uuid = elem.get("UUID")
+            if folio is not None and uuid is not None:
+                break
+        return (folio, uuid)
+    except ET.ParseError:
+        return (None, None)
+
+
+def escapar_para_consola(s: str) -> str:
     """
-    if value is None:
-        return ""
-    # Escapar backslashes primero (importante: hacerlo primero)
-    value = str(value).replace("\\", "\\\\")
-    # Escapar comillas dobles
-    value = value.replace('"', '\\"')
-    # Escapar variables $ (por si acaso hay variables en el contenido)
-    value = value.replace("$", "\\$")
-    # Escapar backticks
-    value = value.replace("`", "\\`")
-    return value
+    Escapa la cadena para ir dentro de comillas dobles en la consola.
+    Doctrine recibe: bin/console doctrine:query:sql "SQL"
+    Dentro del SQL, las comillas dobles de los literales deben ser \\"
+    y las barras invertidas que introduzcamos deben escaparse si es necesario.
+    """
+    # Escapar backslash primero, luego comillas dobles
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def extract_tfd_element(xml_content):
-    """Extrae el elemento completo TimbreFiscalDigital del XML."""
-    # Buscar el elemento TimbreFiscalDigital usando regex
-    # Puede ser auto-cerrado (<tfd:TimbreFiscalDigital ... />) o con etiquetas separadas
-    # Primero intentar elemento auto-cerrado
-    pattern = r'<tfd:TimbreFiscalDigital[^>]*/>'
-    match = re.search(pattern, xml_content, re.DOTALL)
-    if match:
-        return match.group(0)
-    
-    # Intentar con etiquetas separadas
-    pattern = r'<tfd:TimbreFiscalDigital[^>]*>.*?</tfd:TimbreFiscalDigital>'
-    match = re.search(pattern, xml_content, re.DOTALL)
-    if match:
-        return match.group(0)
-    
-    # Intentar con namespace alternativo (auto-cerrado)
-    pattern = r'<[^:]*:TimbreFiscalDigital[^>]*/>'
-    match = re.search(pattern, xml_content, re.DOTALL)
-    if match:
-        return match.group(0)
-    
-    # Intentar con namespace alternativo (etiquetas separadas)
-    pattern = r'<[^:]*:TimbreFiscalDigital[^>]*>.*?</[^:]*:TimbreFiscalDigital>'
-    match = re.search(pattern, xml_content, re.DOTALL)
-    if match:
-        return match.group(0)
-    
-    return None
-
-
-def get_receptor_rfc(xml_content):
-    """Extrae el RFC del receptor del XML."""
-    try:
-        root = ET.fromstring(xml_content)
-        
-        # Intentar con namespace cfdi
-        receptor = root.find('.//{http://www.sat.gob.mx/cfd/4}Receptor')
-        if receptor is not None and 'Rfc' in receptor.attrib:
-            return receptor.get('Rfc')
-        
-        # Buscar en todo el árbol cualquier elemento que contenga "Receptor" en el tag
-        for elem in root.iter():
-            if 'Receptor' in elem.tag and 'Rfc' in elem.attrib:
-                return elem.get('Rfc')
-        
-        # Como último recurso, buscar con regex
-        pattern = r'<[^:]*:Receptor[^>]*Rfc="([^"]+)"'
-        match = re.search(pattern, xml_content)
-        if match:
-            return match.group(1)
-                
-    except ET.ParseError as e:
-        print(f"Error al parsear XML: {e}")
-    except Exception as e:
-        print(f"Error al extraer RFC: {e}")
-    
-    return None
-
-
-def get_uuid_from_xml(xml_content):
-    """Extrae el UUID del XML."""
-    try:
-        root = ET.fromstring(xml_content)
-        # Buscar el elemento TimbreFiscalDigital
-        tfd = root.find('.//{http://www.sat.gob.mx/TimbreFiscalDigital}TimbreFiscalDigital')
-        if tfd is not None and 'UUID' in tfd.attrib:
-            return tfd.get('UUID')
-        
-        # Intentar sin namespace
-        for elem in root.iter():
-            if 'TimbreFiscalDigital' in elem.tag and 'UUID' in elem.attrib:
-                return elem.get('UUID')
-        
-        # Como último recurso, buscar con regex
-        pattern = r'<[^:]*:TimbreFiscalDigital[^>]*UUID="([^"]+)"'
-        match = re.search(pattern, xml_content)
-        if match:
-            return match.group(1)
-                
-    except ET.ParseError as e:
-        print(f"Error al parsear XML: {e}")
-    except Exception as e:
-        print(f"Error al extraer UUID: {e}")
-    
-    return None
-
-
-def process_company_folder(company_path):
-    """Procesa una carpeta de compañía y genera el archivo queries.sql."""
-    company_path = Path(company_path)
-    csv_file = company_path / "informations.csv"
-    
-    # Intentar también con "information.csv" si no existe "informations.csv"
-    if not csv_file.exists():
-        csv_file = company_path / "information.csv"
-    
-    if not csv_file.exists():
-        print(f"Advertencia: No se encontró archivo CSV en {company_path}")
-        return
-    
-    xmls_folder = company_path / "XMLS"
-    if not xmls_folder.exists():
-        print(f"Advertencia: No se encontró carpeta XMLS en {company_path}")
-        return
-    
-    # Leer el CSV
-    records = []
-    try:
-        with open(csv_file, 'r', encoding='utf-8') as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if len(row) >= 2:
-                    record_id = row[0].strip()
-                    rfc = row[1].strip()
-                    records.append((record_id, rfc))
-    except Exception as e:
-        print(f"Error al leer CSV {csv_file}: {e}")
-        return
-    
-    # Cargar todos los XMLs en memoria
-    xml_files = {}
-    for xml_file in xmls_folder.glob("*.xml"):
+def procesar_carpeta_compania(base: Path, carpeta_compania: Path, carpeta_xmls: Path) -> None:
+    """Genera querys.sql y search.sql en la carpeta de la compañía a partir de los XML en XMLS/."""
+    lineas_sql = []
+    folios = []
+    for archivo_xml in sorted(carpeta_xmls.glob("*.xml")):
         try:
-            with open(xml_file, 'r', encoding='utf-8') as f:
-                xml_content = f.read()
-                receptor_rfc = get_receptor_rfc(xml_content)
-                if receptor_rfc:
-                    xml_files[receptor_rfc.upper()] = {
-                        'path': xml_file,
-                        'content': xml_content
-                    }
-        except Exception as e:
-            print(f"Error al leer XML {xml_file}: {e}")
-    
-    # Generar queries SQL
-    queries = []
-    for record_id, rfc in records:
-        rfc_upper = rfc.upper()
-        if rfc_upper in xml_files:
-            xml_data = xml_files[rfc_upper]
-            xml_content = xml_data['content']
-            xml_filename = xml_data['path'].name
-            
-            # Extraer información del XML
-            uuid = get_uuid_from_xml(xml_content)
-            tfd_element = extract_tfd_element(xml_content)
-            
-            if uuid and tfd_element:
-                # Escapar el contenido del XML y TFD para SQL (comillas simples escapadas con '')
-                xml_escaped_sql = escape_sql_string(xml_content)
-                tfd_escaped_sql = escape_sql_string(tfd_element)
-                uuid_escaped_sql = escape_sql_string(uuid)
-                
-                # Construir la query SQL
-                sql_query = f"UPDATE invoice_invoice_attempts SET xml = {xml_escaped_sql}, tfd = {tfd_escaped_sql}, raw_response = null, uuid = {uuid_escaped_sql} WHERE id = {record_id}"
-                
-                # Escapar la query SQL completa para que funcione dentro de comillas dobles en la shell
-                sql_query_escaped = escape_for_shell_double_quotes(sql_query)
-                
-                # Generar el comando completo de Symfony
-                command = f'bin/console doctrine:query:sql "{sql_query_escaped}"'
-                queries.append(command)
-            else:
-                print(f"Advertencia: No se pudo extraer UUID o TFD para RFC {rfc} (ID: {record_id})")
-        else:
-            print(f"Advertencia: No se encontró XML para RFC {rfc} (ID: {record_id})")
-    
-    # Escribir el archivo queries.sql
-    output_file = company_path / "queries.sql"
-    try:
-        with open(output_file, 'w', encoding='utf-8') as f:
-            for query in queries:
-                f.write(query + '\n')
-        print(f"✓ Generado {output_file} con {len(queries)} queries")
-    except Exception as e:
-        print(f"Error al escribir {output_file}: {e}")
+            contenido_xml = archivo_xml.read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            continue
+        if not contenido_xml:
+            continue
+
+        tfd_texto = extraer_tfd_como_texto(contenido_xml)
+        folio, uuid = extraer_folio_y_uuid(contenido_xml)
+        if not folio:
+            continue
+        if not uuid:
+            uuid = ""
+
+        # Escapar valores para meter dentro de comillas dobles en la consola
+        xml_esc = escapar_para_consola(contenido_xml)
+        tfd_esc = escapar_para_consola(tfd_texto)
+        uuid_sql = f'"{uuid}"'
+        # UPDATE ... set xml = "...", tfd = "...", raw_response = null, uuid = "...", status = 1 where invoice_id = ... and type = 2
+        sql = (
+            f'UPDATE invoice_invoice_attempts SET xml = "{xml_esc}", tfd = "{tfd_esc}", '
+            f'raw_response = NULL, uuid = {uuid_sql}, status = 1 '
+            f"WHERE invoice_id = {folio} AND type = 2"
+        )
+        linea_consola = f'bin/console doctrine:query:sql "{escapar_para_consola(sql)}"'
+        lineas_sql.append(linea_consola)
+        folios.append(folio)
+
+    if not lineas_sql:
+        return
+
+    archivo_salida = carpeta_compania / "querys.sql"
+    archivo_salida.write_text("\n".join(lineas_sql) + "\n", encoding="utf-8")
+    print(f"  {archivo_salida.relative_to(base)}: {len(lineas_sql)} consulta(s)")
+
+    # search.sql: Select parent_id from invoice_invoices where id in (numero_folio, ...)
+    lista_folios = ", ".join(folios)
+    search_sql = f"Select parent_id from invoice_invoices where id in ({lista_folios})"
+    archivo_search = carpeta_compania / "search.sql"
+    archivo_search.write_text(search_sql + "\n", encoding="utf-8")
+    print(f"  {archivo_search.relative_to(base)}")
 
 
 def main():
-    """Función principal."""
-    # Obtener el directorio actual del script
-    script_dir = Path(__file__).parent
-    
-    # Buscar todas las carpetas de compañías (carpetas que no sean el directorio raíz ni contengan instructions.md)
-    company_folders = []
-    for item in script_dir.iterdir():
-        if item.is_dir() and item.name != "XMLS" and not item.name.startswith('.'):
-            # Verificar que tenga una carpeta XMLS o un archivo CSV
-            if (item / "XMLS").exists() or (item / "informations.csv").exists() or (item / "information.csv").exists():
-                company_folders.append(item)
-    
-    if not company_folders:
-        print("No se encontraron carpetas de compañías para procesar.")
-        return
-    
-    print(f"Procesando {len(company_folders)} carpeta(s) de compañía(s)...\n")
-    
-    for company_folder in company_folders:
-        print(f"Procesando: {company_folder.name}")
-        process_company_folder(company_folder)
-        print()
-    
-    print("Proceso completado.")
+    base = Path(__file__).resolve().parent
+    # Carpetas de compañía: solo las que tienen subcarpeta "XMLS" con archivos .xml
+    subcarpeta_xmls = "XMLS"
+    encontradas = 0
+    print(f"Procesando compañías (carpetas con {subcarpeta_xmls}/)...")
+    for carpeta in sorted(base.iterdir()):
+        if not carpeta.is_dir() or carpeta.name.startswith("."):
+            continue
+        carpeta_xmls = carpeta / subcarpeta_xmls
+        if not carpeta_xmls.is_dir():
+            continue
+        xmls = list(carpeta_xmls.glob("*.xml"))
+        if not xmls:
+            continue
+        print(f"\n--- {carpeta.name}/{subcarpeta_xmls}/")
+        procesar_carpeta_compania(base, carpeta, carpeta_xmls)
+        encontradas += 1
+    if encontradas == 0:
+        print(f"No se encontraron carpetas de compañía con subcarpeta '{subcarpeta_xmls}' y archivos .xml.")
+    print("\nProceso terminado.")
 
 
 if __name__ == "__main__":
     main()
-
